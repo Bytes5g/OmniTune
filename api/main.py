@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from secrets import compare_digest
+from threading import Lock
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -12,7 +14,10 @@ from trainer.unsloth_trainer import UnslothTrainer
 app = FastAPI(title="OmniTune Engine", version="0.1.0")
 
 # تخزين خفيف داخل الذاكرة لمرحلة التأسيس فقط؛ لاحقاً يُستبدل بقاعدة بيانات أو Redis.
+# تنبيه: هذا النمط غير مناسب للإنتاج مع تعدد worker processes لأن كل عملية تملك ذاكرة مستقلة.
+# تنبيه إضافي: جميع حالات المهام ستفقد عند إعادة تشغيل الخادم.
 TASKS: dict[str, dict[str, Any]] = {}
+TASKS_LOCK = Lock()
 
 
 class TrainingRequest(BaseModel):
@@ -38,9 +43,14 @@ def _execute_training_task(task_id: str, payload: TrainingRequest) -> None:
         )
         result = trainer.run(chatml_dataset)
 
-        TASKS[task_id] = {"status": "completed", "result": result}
+        with TASKS_LOCK:
+            task_token = TASKS.get(task_id, {}).get("task_token")
+            TASKS[task_id] = {"status": "completed", "result": result, "task_token": task_token}
+    # نلتقط أي خطأ هنا لضمان تحويل فشل المهمة إلى حالة يمكن تتبعها عبر API بدلاً من فقدانها بصمت.
     except Exception as exc:  # pragma: no cover
-        TASKS[task_id] = {"status": "failed", "error": str(exc)}
+        with TASKS_LOCK:
+            task_token = TASKS.get(task_id, {}).get("task_token")
+            TASKS[task_id] = {"status": "failed", "error": str(exc), "task_token": task_token}
 
 
 @app.get("/health")
@@ -51,16 +61,28 @@ def health() -> dict[str, str]:
 @app.post("/train")
 def create_training_job(request: TrainingRequest, background_tasks: BackgroundTasks) -> dict[str, str]:
     task_id = str(uuid4())
-    TASKS[task_id] = {"status": "queued"}
+    task_token = str(uuid4())
+    with TASKS_LOCK:
+        TASKS[task_id] = {"status": "queued", "task_token": task_token}
     background_tasks.add_task(_execute_training_task, task_id, request)
 
     return {
         "task_id": task_id,
+        "task_token": task_token,
         "status": "queued",
         "message": "تم استلام المهمة وتشغيلها في الخلفية.",
     }
 
 
 @app.get("/train/{task_id}")
-def get_training_job(task_id: str) -> dict[str, Any]:
-    return TASKS.get(task_id, {"status": "not_found"})
+def get_training_job(task_id: str, task_token: str) -> dict[str, Any]:
+    with TASKS_LOCK:
+        task_payload = TASKS.get(task_id)
+
+    if not task_payload:
+        return {"status": "not_found"}
+
+    if not compare_digest(task_payload.get("task_token", ""), task_token):
+        return {"status": "forbidden"}
+
+    return {k: v for k, v in task_payload.items() if k != "task_token"}
