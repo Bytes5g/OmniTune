@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from secrets import compare_digest
 from threading import Lock
 from typing import Any, Literal
@@ -12,10 +13,12 @@ from data_pipeline.mock_loader import MockDataLoader
 from trainer.unsloth_trainer import UnslothTrainer
 
 app = FastAPI(title="OmniTune Engine", version="0.1.0")
+LOGGER = logging.getLogger(__name__)
 
 # تخزين خفيف داخل الذاكرة لمرحلة التأسيس فقط؛ لاحقاً يُستبدل بقاعدة بيانات أو Redis.
 # تنبيه: هذا النمط غير مناسب للإنتاج مع تعدد worker processes لأن كل عملية تملك ذاكرة مستقلة.
 # تنبيه إضافي: جميع حالات المهام ستفقد عند إعادة تشغيل الخادم.
+# مسار التحسين مخطط له في docs/02_execution_plan.md ضمن المرحلة 4 (Celery + Redis).
 TASKS: dict[str, dict[str, Any]] = {}
 TASKS_LOCK = Lock()
 
@@ -48,6 +51,7 @@ def _execute_training_task(task_id: str, payload: TrainingRequest) -> None:
             TASKS[task_id] = {"status": "completed", "result": result, "task_token": task_token}
     # نلتقط أي خطأ هنا لضمان تحويل فشل المهمة إلى حالة يمكن تتبعها عبر API بدلاً من فقدانها بصمت.
     except Exception as exc:  # pragma: no cover
+        LOGGER.exception("فشل تنفيذ مهمة التدريب في الخلفية: task_id=%s", task_id)
         with TASKS_LOCK:
             task_token = TASKS.get(task_id, {}).get("task_token")
             TASKS[task_id] = {"status": "failed", "error": str(exc), "task_token": task_token}
